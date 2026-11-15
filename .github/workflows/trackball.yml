@@ -1,0 +1,91 @@
+name: roBa trackball
+run-name: roBa trackball ${{ inputs.cpi }} CPI (${{ inputs.request }})
+on:
+  workflow_dispatch:
+    inputs:
+      cpi:
+        description: Target CPI (200 to 3200 in steps of 200, or 650)
+        type: string
+        required: true
+        default: '650'
+      request:
+        description: Build request ID (optional)
+        type: string
+        default: manual
+
+permissions:
+  contents: read
+
+jobs:
+  right:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    container: zmkfirmware/zmk-build-arm:stable
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set trackball sensitivity
+        env:
+          TARGET_CPI: ${{ inputs.cpi }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          target = os.environ['TARGET_CPI']
+          if not re.fullmatch(r'[0-9]{3,4}', target):
+              raise SystemExit('Invalid CPI')
+          cpi = int(target)
+          if cpi != 650 and (not 200 <= cpi <= 3200 or cpi % 200):
+              raise SystemExit('Invalid CPI')
+
+          shield = Path('boards/shields/roBa')
+          conf = shield / 'roBa_R.conf'
+          conf_text = conf.read_text()
+          if not re.search(r'^CONFIG_PMW3610_CPI_DIVIDOR=1\s*$', conf_text, re.M):
+              raise SystemExit('Expected the standard roBa CPI divisor of 1')
+          sensor_cpi = 600 if cpi == 650 else cpi
+          contents, count = re.subn(r'^CONFIG_PMW3610_CPI=\d+$',
+                                    f'CONFIG_PMW3610_CPI={sensor_cpi}', conf_text, flags=re.M)
+          if count != 1:
+              raise SystemExit('Expected exactly one normal CPI setting')
+          conf.write_text(contents)
+
+          if cpi == 650:
+              overlay = shield / 'roBa_R.overlay'
+              contents = overlay.read_text()
+              if 'input-processors' in contents or contents.count('trackball_listener {') != 1:
+                  raise SystemExit('Trackball overlay has changed. Check its input processors.')
+              overlay.write_text('#include <input/processors.dtsi>\n' + contents.replace(
+                  'trackball_listener {',
+                  'trackball_listener {\n        input-processors = <&zip_xy_scaler 13 12>;'))
+          PY
+      - name: Set up the ZMK workspace
+        run: |
+          mkdir /tmp/roba-zmk
+          cp -R config /tmp/roba-zmk/config
+          cd /tmp/roba-zmk
+          west init -l config
+          west update --fetch-opt=--filter=tree:0
+          west zephyr-export
+      - name: Build and verify right-side firmware
+        env:
+          TARGET_CPI: ${{ inputs.cpi }}
+        working-directory: /tmp/roba-zmk
+        run: |
+          west build -s zmk/app -d build -b seeeduino_xiao_ble -S studio-rpc-usb-uart -- \
+            -DZMK_CONFIG=/tmp/roba-zmk/config -DSHIELD=roBa_R -DZMK_EXTRA_MODULES="$GITHUB_WORKSPACE"
+          sensor_cpi="$TARGET_CPI"
+          if [ "$TARGET_CPI" = 650 ]; then
+            sensor_cpi=600
+            grep -E 'input-processors.*(0xd +0xc|13 +12)' build/zephyr/zephyr.dts
+          fi
+          grep -Fx "CONFIG_PMW3610_CPI=$sensor_cpi" build/zephyr/.config
+          cp build/zephyr/zmk.uf2 "$GITHUB_WORKSPACE/roBa_R-$TARGET_CPI.uf2"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: roBa_R-${{ inputs.cpi }}
+          path: roBa_R-${{ inputs.cpi }}.uf2
+          if-no-files-found: error
